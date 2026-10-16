@@ -1,0 +1,59 @@
+# Python / pytest
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+# Extension builds / caches
+build/
+dist/
+*.so
+*.pyd
+*.o
+*.obj
+.ninja_*
+torch_extensions/
+# Generated profiling artifacts; keep existing reports on disk
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.sqlite-*
+*.pt.trace.json
+*.trace.json
+*.trace.json.gz
+*.sqlite3
+*.sqlite3-*
+# Local environments
+.env
+.venv/
+
+# Temporary benchmark results and logs (keep source/configuration elsewhere)
+/benchmark.json
+/benchmark-results*.json
+/benchmark_results*.json
+/benchmarks/*.json
+/benchmarks/*.jsonl
+/benchmarks/results/
+*.log
+/logs/
+
+# Local virtual/Conda environments; environment.yml remains trackable
+/venv/
+/env/
+/envs/
+/.conda/
+/conda-env/
+/conda-envs/
+/miniconda3/
+/anaconda3/
+.env.*
+!.env.example
+!.env.template
+
+# Personal IDE paths, local scratch and generated deliverables
+/.vscode/
+/work/
+/outputs/
+
+# Obsolete misspelled ignore file: retained locally, removed from the index
+/.gitingnore

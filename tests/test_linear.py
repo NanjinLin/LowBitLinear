@@ -1,78 +1,66 @@
+import pytest
 import torch
-import torch.nn.functional as F
 
-from lowbitlinear.quantization import (
-    quantize_int4,
-    dequantize_int4,
-    pack_int4,
-)
+from lowbitlinear import QuantizedLinear
+from lowbitlinear.quantization import quantize_int4, dequantize_int4, pack_int4
 from lowbitlinear.linear import linear_int4_reference
 
 
-def test_linear_int4():
+@pytest.mark.parametrize("m", [1, 16])
+def test_linear_int4_reference(m):
     torch.manual_seed(42)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    M, N, K = 16, 128, 256
-
-    x = torch.randn(M, K, device=device, dtype=torch.float16)
-    weight = torch.randn(N, K, device=device, dtype=torch.float16)
-
-    # Quantization + Packing
-    q, scales, zeros = quantize_int4(weight, group_size=64)
+    x = torch.randn(m, 256, dtype=torch.float16)
+    q, scales, zeros = quantize_int4(torch.randn(129, 256))
     packed = pack_int4(q)
-
-    # 我们自己的 Linear
-    y_custom = linear_int4_reference(
-        x, packed, scales, zeros, group_size=64
-    )
-
-    # 用未打包的量化权重构建参考结果
-    restored = dequantize_int4(q, scales, zeros, group_size=64)
-    y_reference = F.linear(x, restored.to(x.dtype))
-
-    # 原始 FP16 Linear（用于观察量化误差）
-    y_original = F.linear(x, weight)
-
-    assert y_custom.shape == (M, N)
-    assert torch.allclose(y_custom, y_reference, atol=1e-3, rtol=1e-3)
-
-    print("Output Shape:", y_custom.shape)
-    print("Implementation Error:",
-          (y_custom - y_reference).abs().max().item())
-    print("Quantization Error:",
-          (y_custom - y_original).abs().max().item())
-
-from lowbitlinear import QuantizedLinear
+    # Same quantized state; no intermediate FP16 dequantized weight rounding.
+    restored = dequantize_int4(q, scales, zeros)
+    expected = (x.float() @ restored.T).half()
+    torch.testing.assert_close(linear_int4_reference(x, packed, scales, zeros), expected, rtol=0, atol=0)
 
 
-def test_quantized_linear_api():
-    torch.manual_seed(42)
+@pytest.mark.parametrize("m", [1, 16])
+@pytest.mark.parametrize("weight_dtype", [torch.float16, torch.float32])
+def test_quantized_linear_api(m, weight_dtype):
+    layer = QuantizedLinear.from_float(torch.randn(129, 256, dtype=weight_dtype))
+    x = torch.randn(m, 256, dtype=torch.float16)
+    expected = linear_int4_reference(x, layer.packed_weight, layer.scales, layer.zeros)
+    assert torch.equal(layer(x), expected)
+    assert set(layer.state_dict()) == {"packed_weight", "scales", "zeros"}
+    restored = QuantizedLinear.from_float(torch.zeros(129, 256, dtype=weight_dtype))
+    restored.load_state_dict(layer.state_dict())
+    assert torch.equal(restored(x), expected)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    weight = torch.randn(128, 256, device=device, dtype=torch.float16)
-    x = torch.randn(16, 256, device=device, dtype=torch.float16)
+@pytest.mark.parametrize("bits", [2, 3, 8, 16, True])
+def test_unsupported_bits(bits):
+    with pytest.raises(ValueError, match="bits=4"):
+        QuantizedLinear.from_float(torch.ones(2, 64), bits=bits)
 
-    layer = QuantizedLinear.from_float(
-        weight,
-        bits=4,
-        group_size=64
-    )
 
-    y = layer(x)
+@pytest.mark.parametrize("x,error", [
+    (torch.ones(1, 64), TypeError),
+    (torch.ones(1, 64, dtype=torch.bfloat16), TypeError),
+    (torch.ones(64, dtype=torch.float16), ValueError),
+    (torch.ones(1, 32, dtype=torch.float16), ValueError),
+    (torch.ones(0, 64, dtype=torch.float16), ValueError),
+])
+def test_invalid_forward_input(x, error):
+    layer = QuantizedLinear.from_float(torch.ones(2, 64))
+    with pytest.raises(error):
+        layer(x)
 
-    y_ref = linear_int4_reference(
-        x,
-        layer.packed_weight,
-        layer.scales,
-        layer.zeros,
-        group_size=64
-    )
 
-    assert y.shape == (16, 128)
-    assert torch.equal(y, y_ref)
+def test_invalid_constructor_metadata():
+    with pytest.raises(ValueError, match="shape"):
+        QuantizedLinear(torch.zeros(2, 8, dtype=torch.int32), torch.ones(2, 2), torch.zeros(2, 1, dtype=torch.int32))
 
-    print("API Output Shape:", y.shape)
-    print("API Correctness: PASS")
+
+def test_forward_device_mismatch(cuda_device):
+    layer = QuantizedLinear.from_float(torch.ones(2, 64))
+    with pytest.raises(ValueError, match="same device"):
+        layer(torch.ones(1, 64, dtype=torch.float16, device=cuda_device))
+
+
+def test_constructor_device_mismatch(cuda_device):
+    with pytest.raises(ValueError, match="same device"):
+        QuantizedLinear(torch.zeros(2, 8, dtype=torch.int32), torch.ones(2, 1, device=cuda_device), torch.zeros(2, 1, dtype=torch.int32))
