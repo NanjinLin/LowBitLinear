@@ -7,7 +7,7 @@
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAException.h>
 
-constexpr int BM = 4;
+constexpr int BM = 8;
 constexpr int BN = 8;
 constexpr int BK = 8;
 
@@ -38,13 +38,17 @@ extern "C" __global__ void w4a16_gemm(
     int local_m = tid / BN;
     int local_n = tid % BN;
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
 
     // 定义寄存器变量 避免同一组重复加载
     float scale_reg = 0.0f;
     int zero_reg = 0;
 
-    for (int g = 0; g < K / 64; g++)
+    // K boundary mask
+    int packed_cols = (K + 7) / 8;
+
+    for (int g = 0; g < (K + 63) / 64; g++)
     {
         // memory coalescing
         // 一个block负责8行 一个warp负责4行 每行8个packed INT32 一个thread一个
@@ -55,20 +59,38 @@ extern "C" __global__ void w4a16_gemm(
             int p = tid % 8;
 
             int n = n0 + rn;
-            int packed_idx = n * (K / 8) + g * 8 + p;
 
-            sp[rn][p] =
-                static_cast<uint32_t>(packed_w[packed_idx]);
+            int packed_col = g * 8 + p;
+
+            if (n < N && packed_col < packed_cols)
+            {
+                int packed_idx = n * packed_cols + packed_col;
+                sp[rn][p] =
+                    static_cast<uint32_t>(packed_w[packed_idx]);
+            }
+            else
+            {
+                sp[rn][p] = 0;
+            }
         }
 
         // quantization
         if (tid < BN)
         {
             int n = n0 + tid;
-            int group_idx = n * (K / 64) + g;
 
-            scale_reg = scales[group_idx];
-            zero_reg = zeros[group_idx];
+            if (n < N)
+            {
+                int group_idx = n * ((K + 63) / 64) + g;
+
+                scale_reg = scales[group_idx];
+                zero_reg = zeros[group_idx];
+            }
+            else
+            {
+                scale_reg = 0.0f;
+                zero_reg = 0.0;
+            }
         }
 
         __syncthreads();
@@ -79,11 +101,25 @@ extern "C" __global__ void w4a16_gemm(
             int k0 = g * 64 + t * BK;
 
             // load X tile
-            int rm = tid / BK;
-            int rk = tid % BK;
+            // 一个thread负责两个输出
+            for (int idx = tid; idx < BM * BK; idx += blockDim.x)
+            {
+                int rm = idx / BK;
+                int rk = idx % BK;
 
-            sx[rm][rk] = x[(m0 + rm) * K + (k0 + rk)];
+                // boundary mask
+                int m = m0 + rm;
+                int k = k0 + rk;
 
+                if (m < M && k < K)
+                {
+                    sx[rm][rk] = x[m * K + k];
+                }
+                else
+                {
+                    sx[rm][rk] = __float2half(0.0f);
+                }
+            }
             // load W tile
             if (tid < BN)
             {
@@ -104,16 +140,30 @@ extern "C" __global__ void w4a16_gemm(
             // calculation
             for (int rk = 0; rk < BK; rk++)
             {
-                float a = __half2float(sx[local_m][rk]);
+                float a0 = __half2float(sx[local_m][rk]);
+                float a1 = __half2float(sx[local_m + 4][rk]);
                 float b = sw[local_n][rk];
-                acc += a * b;
+
+                acc0 += a0 * b;
+                acc1 += a1 * b;
             }
 
             __syncthreads();
         }
     }
 
-    y[(m0 + local_m) * N + n0 + local_n] = __float2half(acc);
+    // regTile + boudary mask
+    int m0_out = m0 + local_m;
+    int m1_out = m0 + local_m + 4;
+    int n = n0 + local_n;
+    if (m0_out < M && n < N)
+    {
+        y[m0_out * N + n] = __float2half(acc0);
+    }
+    if (m1_out < M && n < N)
+    {
+        y[m1_out * N + n] = __float2half(acc1);
+    }
 }
 
 at::Tensor w4a16_gemm_launcher(
@@ -134,8 +184,8 @@ at::Tensor w4a16_gemm_launcher(
 
     // check
     TORCH_CHECK(x.is_cuda() && w.is_cuda(), "x/w must be CUDA");
-    TORCH_CHECK(w.size(1) == K / 8,
-                "packed_w must have shape [N, K/8]");
+    TORCH_CHECK(w.size(1) == (K + 7) / 8,
+                "packed_w must have shape [N, (K + 7)/8]");
     TORCH_CHECK(x.scalar_type() == at::kHalf,
                 "x must be FP16");
 
@@ -146,14 +196,8 @@ at::Tensor w4a16_gemm_launcher(
                 "All tensors must be contiguous");
     TORCH_CHECK(x.device() == w.device(),
                 "All tensors must be on the same GPU");
-    TORCH_CHECK(M % BM == 0);
-    TORCH_CHECK(N % BN == 0);
-    TORCH_CHECK(K % BK == 0);
 
     TORCH_CHECK(M > 0 && N > 0 && K > 0);
-
-    TORCH_CHECK(K % 64 == 0,
-                "K must be divisible by group_size=64");
 
     TORCH_CHECK(scales.dim() == 2,
                 "scales must be 2D");
@@ -163,13 +207,13 @@ at::Tensor w4a16_gemm_launcher(
 
     TORCH_CHECK(
         scales.size(0) == N &&
-            scales.size(1) == K / 64,
-        "scales must have shape [N, K/64]");
+            scales.size(1) == (K + 63) / 64,
+        "scales must have shape [N, (K + 63)/64]");
 
     TORCH_CHECK(
         zeros.size(0) == N &&
-            zeros.size(1) == K / 64,
-        "zeros must have shape [N, K/64]");
+            zeros.size(1) == (K + 63) / 64,
+        "zeros must have shape [N, (K + 63)/64]");
 
     TORCH_CHECK(scales.scalar_type() == at::kFloat);
     TORCH_CHECK(zeros.scalar_type() == at::kInt);
@@ -202,7 +246,7 @@ at::Tensor w4a16_gemm_launcher(
         reinterpret_cast<half *>(y.data_ptr<at::Half>());
 
     // launch kernel
-    dim3 block(BM * BN);
+    dim3 block(32);
 
     dim3 grid(
         (N + BN - 1) / BN,

@@ -13,8 +13,10 @@ if torch.version.cuda is not None and CUDA_HOME is not None:
                 "csrc/w4a16_gemv_naive.cu",
                 "csrc/w4a16_gemv_warp.cu",
                 "csrc/w4a16_gemv_warp_vec.cu",
+                "csrc/w4a16_gemm.cu",
+                "csrc/w4a16_gemm_padding_baseline.cu"
             ],
-            extra_compile_args={"cxx": ["-O2"], "nvcc": ["-O2"]},
+            extra_compile_args={"cxx": ["-O2"], "nvcc": ["-O3", "-lineinfo"]},
         )
     )
 setup(ext_modules=ext_modules, cmdclass={"build_ext": BuildExtension})
