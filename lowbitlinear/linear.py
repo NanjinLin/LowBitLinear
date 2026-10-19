@@ -95,6 +95,8 @@ class QuantizedLinear(torch.nn.Module):
     def forward(self, x):
         _validate_packed_weight(self.packed_weight, self.scales, self.zeros, self.group_size, self.in_features)
         _validate_input(x, self.packed_weight, self.in_features)
+        if not x.is_contiguous():
+            raise ValueError("CUDA input x must be contiguous")
         if x.is_cuda and self.group_size == 64:
             load_cuda_extension(required=True)
 
@@ -111,7 +113,7 @@ class QuantizedLinear(torch.nn.Module):
                     self.group_size
                 )
 
-            return torch.ops.lowbitlinear_ext.w4a16_gemm(
+            return torch.ops.lowbitlinear_cute_w4a16.gemm(
                 x,
                 self.packed_weight,
                 self.scales,
