@@ -10,6 +10,9 @@ SHAPES = [
     (17, 23, 65), (5, 9, 70), (6, 10, 71), (31, 33, 127),
     (6, 10, 128), (33, 37, 129), (64, 65, 130), (79, 70, 192),
     (32, 64, 512), (7, 35, 4096),
+    # Exercise both sides of the 64x64 CTA boundary, including K tails.
+    (63, 63, 63), (65, 63, 64), (63, 65, 65), (65, 65, 129),
+    (127, 129, 192),
 ]
 
 
@@ -35,7 +38,7 @@ def test_gemm(m, n, k, real_quant, cuda_ops, packed_reference):
     torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)
 
 
-@pytest.mark.parametrize("m,n,k", [(32, 32, 64), (17, 23, 129)])
+@pytest.mark.parametrize("m,n,k", [(32, 32, 64), (17, 23, 129), (65, 65, 129)])
 def test_exact_multistage_accumulation(m, n, k, cuda_ops):
     x = torch.ones(m, k, device=cuda_ops, dtype=torch.float16)
     packed = pack_int4(torch.full((n, k), 5, device=cuda_ops, dtype=torch.uint8))
@@ -45,8 +48,8 @@ def test_exact_multistage_accumulation(m, n, k, cuda_ops):
     torch.testing.assert_close(actual, torch.full_like(actual, k * .5), rtol=0, atol=0)
 
 
-def test_one_hot_mapping(cuda_ops):
-    m, n, k = 33, 65, 129
+@pytest.mark.parametrize("m,n,k", [(33, 65, 129), (65, 129, 129)])
+def test_one_hot_mapping(m, n, k, cuda_ops):
     x = (torch.arange(m * k, device=cuda_ops).reshape(m, k) % 101).half()
     q = torch.zeros(n, k, dtype=torch.uint8, device=cuda_ops)
     positions = (torch.arange(n, device=cuda_ops) * 2) % k

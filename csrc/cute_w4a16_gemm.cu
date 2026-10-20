@@ -7,11 +7,18 @@
 
 using namespace cute;
 
+namespace
+{
+constexpr int kBlockM = 64;
+constexpr int kBlockN = 64;
+constexpr int kBlockK = 64;
+} // namespace
+
 // Y[M,N] = X[M,K] @ dequant(packed_w[N,ceil(K/8)]).T
 // x: FP16; packed_w: int32 (8 unsigned INT4 per word, low nibble first)
 // scales: FP32 [N,ceil(K/64)]; zeros: int32 [N,ceil(K/64)].
 // group_size=64; FP32 dequant -> FP16 MMA input; FP32 accumulation -> FP16 output.
-// One CTA computes a 32x32 output tile; each CTA works through K in 64-wide stages.
+// One CTA computes a 64x64 output tile; each CTA works through K in 64-wide stages.
 __global__ void cute_w4a16_gemm_kernel(
     half_t const *X,
     int32_t const *packed_w,
@@ -22,9 +29,9 @@ __global__ void cute_w4a16_gemm_kernel(
     int64_t N,
     int64_t K)
 {
-    constexpr int BM = 32;
-    constexpr int BN = 32;
-    constexpr int BK = 64;
+    constexpr int BM = kBlockM;
+    constexpr int BN = kBlockN;
+    constexpr int BK = kBlockK;
 
     const int64_t m0 = blockIdx.y * BM;
     const int64_t n0 = blockIdx.x * BN;
@@ -36,12 +43,13 @@ __global__ void cute_w4a16_gemm_kernel(
         Swizzle<3, 3, 3>{},
         Layout<Shape<_8, Shape<_8, _8>>,
                Stride<_8, Stride<_1, _64>>>{});
-    auto smem_layout = tile_to_shape(smem_atom, make_shape(_32{}, _64{}));
+    auto smem_layout_x = tile_to_shape(smem_atom, make_shape(Int<BM>{}, Int<BK>{}));
+    auto smem_layout_w = tile_to_shape(smem_atom, make_shape(Int<BN>{}, Int<BK>{}));
 
     __align__(16) __shared__ half_t smemX[BM * BK];
     __align__(16) __shared__ half_t smemW[BN * BK];
-    Tensor sX = make_tensor(make_smem_ptr(smemX), smem_layout);
-    Tensor sW = make_tensor(make_smem_ptr(smemW), smem_layout);
+    Tensor sX = make_tensor(make_smem_ptr(smemX), smem_layout_x);
+    Tensor sW = make_tensor(make_smem_ptr(smemW), smem_layout_w);
 
     // tiled copy
     auto g2s = make_tiled_copy(
@@ -54,7 +62,7 @@ __global__ void cute_w4a16_gemm_kernel(
     auto mma = make_tiled_mma(
         SM80_16x8x16_F32F16F16F32_TN{},
         Layout<Shape<_2, _2>>{},
-        Tile<_32, _32, _16>{});
+        Tile<Int<BM>, Int<BN>, _16>{});
     auto thr_mma = mma.get_slice(threadIdx.x);
 
     Tensor tCrX = thr_mma.partition_fragment_A(sX);
@@ -63,14 +71,14 @@ __global__ void cute_w4a16_gemm_kernel(
     // Y tile prepare
     Tensor gYtile = make_tensor(
         make_gmem_ptr(Y + m0 * N + n0),
-        make_layout(Shape<_32, _32>{}, make_stride(N, _1{})));
+        make_layout(Shape<Int<BM>, Int<BN>>{}, make_stride(N, _1{})));
     Tensor tYgY = thr_mma.partition_C(gYtile);
     Tensor tCrY = thr_mma.make_fragment_C(tYgY);
     clear(tCrY); // Once per output tile, NOT once per K stage.
 
     // Local logical output coordinates, partitioned identically to gYtile.
     // 在store时判断是否越界
-    Tensor cY = make_identity_tensor(make_shape(_32{}, _32{}));
+    Tensor cY = make_identity_tensor(make_shape(Int<BM>{}, Int<BN>{}));
     Tensor tYcY = thr_mma.partition_C(cY);
 
     // ldmatrix -> register MMA operand path.
@@ -92,7 +100,7 @@ __global__ void cute_w4a16_gemm_kernel(
         {
             Tensor gXtile = make_tensor(
                 make_gmem_ptr(X + m0 * K + k0),
-                make_layout(Shape<_32, _64>{}, make_stride(K, _1{})));
+                make_layout(Shape<Int<BM>, Int<BK>>{}, make_stride(K, _1{})));
             copy(g2s, thr_g2s.partition_S(gXtile), thr_g2s.partition_D(sX));
         }
         else
@@ -225,8 +233,8 @@ at::Tensor cute_w4a16_gemm_launcher(
 
     at::Tensor Y = at::empty({M, N}, X.options());
     const dim3 grid(
-        static_cast<unsigned int>((N + 31) / 32),
-        static_cast<unsigned int>((M + 31) / 32));
+        static_cast<unsigned int>((N + kBlockN - 1) / kBlockN),
+        static_cast<unsigned int>((M + kBlockM - 1) / kBlockM));
     cute_w4a16_gemm_kernel<<<grid, 128, 0,
                              c10::cuda::getCurrentCUDAStream().stream()>>>(
         reinterpret_cast<half_t const *>(X.data_ptr<at::Half>()),

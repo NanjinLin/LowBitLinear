@@ -130,10 +130,12 @@ CuTe 与未舍入的 FP32 反量化 reference 原本具有不同语义，不能�
 | GEMV | 1x2048x4096 | 较大权重与长 K |
 | CuTe | 1x1x1 | 最小边界、launch floor；不是吞吐代表 |
 | CuTe | 17x23x65 | M/N/K 尾块、两组量化、尾 word |
-| CuTe | 33x37x129 | 跨 CTA、三 K stage、部分尾组 |
+| CuTe | 33x37x129 | M/N 尾块、三 K stage、部分尾组 |
 | CuTe | 32x64x512 | 小规模对齐、多 stage |
 | CuTe | 128x256x1024 | 中规模 |
 | CuTe | 512x2048x2048 | 较大 prefill，仍可在当前 4 GiB 环境验证 |
+
+当前正式 CuTe GEMM 使用 64x64x64 CTA tile、128 线程；Tests 另外覆盖 63/64/65 边界与跨 CTA 映射。
 
 空矩阵正确性由 Tests 覆盖，不纳入性能排名。
 

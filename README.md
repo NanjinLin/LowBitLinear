@@ -15,7 +15,7 @@ a lightweight CUDA kernel library for W4A16 (INT4 weights × FP16 activations) l
 
 It provides fused weight dequantization and matrix computation through custom CUDA GEMV kernels and CuTe-based Tensor Core GEMM kernels, avoiding full weight dequantization into an intermediate matrix during accelerated execution.
 
-Inspired by [AWQ](https://github.com/mit-han-lab/llm-awq) and [GitHub](https://github.com/Supercomputing-System-AI-Lab/MiLo), Pewee focuses on efficient low-bit computation, GPU kernel optimization, and reproducible performance evaluation.
+Inspired by [AWQ](https://github.com/mit-han-lab/llm-awq) and [MiLo](https://github.com/Supercomputing-System-AI-Lab/MiLo), Pewee focuses on efficient low-bit computation, GPU kernel optimization, and reproducible performance evaluation.
 
 ## Key Features
 
@@ -23,7 +23,6 @@ Inspired by [AWQ](https://github.com/mit-han-lab/llm-awq) and [GitHub](https://g
 - **Fused CUDA Kernels** — On-the-fly INT4 unpacking and dequantization, without materializing a full dequantized weight matrix in the optimized GPU paths.
 - **Optimized GEMV & GEMM** — Warp-level CUDA GEMV and CuTe-based Tensor Core GEMM for different workloads.
 - **PyTorch Integration** — Installable C++/CUDA extension with a Python interface and automatic selection between supported execution paths.
-- **Correctness & Benchmarking** — Numerical validation, performance benchmarks, and profiling-oriented optimization.
 
 ## Installation
 
@@ -97,6 +96,53 @@ The `QuantizedLinear` module automatically selects the supported GEMV, GEMM, or 
 Weights are quantized once during `from_float()`, while the optimized CUDA kernels perform INT4 unpacking and dequantization on the fly.
 
 **Note:** The current implementation focuses on FP16 inference with INT4 weights and group-wise quantization (`group_size=64` for the optimized CUDA paths).
+
+## Performance
+
+### Kernel Benchmark
+
+| Linear | Native FP16 | Unfused W4A16 | Pewee Fused | Speedup vs Unfused |
+|---|---:|---:|---:|---:|
+| QKV | 160.382 | 9186.432 | 303.680 | 30.25x |
+| O | 81.472 | 6136.952 | 244.992 | 25.05x |
+| Gate/Up | 478.452 | 39823.744 | 1180.358 | 33.74x |
+| Down | 257.024 | 18669.248 | 721.664 | 25.87x |
+
+### End-to-End Inference
+
+Qwen3-8B | NVIDIA A10 | Batch=1 | TP=1 | Eager mode | 64 output tokens | Median latency (ms, lower is better)
+
+| Input / Output | Mode | TTFT (ms) | TPOT (ms) | E2E (ms) |
+|---|---|---:|---:|---:|
+| 32 / 64 | Native FP16 | 44.626 | 38.519 | 2471.572 |
+| 32 / 64 | Pewee W4A16 | 163.521 | 44.697 | 2979.389 |
+| 128 / 64 | Native FP16 | 43.984 | 38.198 | 2450.429 |
+| 128 / 64 | Pewee W4A16 | 109.802 | 44.795 | 2932.329 |
+| 192 / 64 | Native FP16 | 59.453 | 39.010 | 2516.262 |
+| 192 / 64 | Pewee W4A16 | 158.251 | 44.392 | 2954.770 |
+
+### Memory Efficiency
+
+| Metric | FP16 | Pewee W4A16 |
+|---|---:|---:|
+| Model weight storage | 15.256 GiB | **6.362 GiB** |
+| GPU memory allocated after initialization | 15.356 GiB | **6.475 GiB** |
+| Peak allocated during inference | 15.370 GiB | **6.489 GiB** |
+| Peak allocated (loading through inference) | 16.438 GiB | **7.609 GiB** |
+| KV Cache | 0.070 GiB | 0.070 GiB |
+
+Pewee reduces Qwen3-8B model weight storage by **58.30%**, from 15.256 GiB to 6.362 GiB, saving approximately 8.89 GiB.
+
+### Environment
+
+| Component | Configuration |
+|---|---|
+| GPU | NVIDIA A10 (SM 8.6, 150 W power cap) |
+| NVIDIA Driver | 550.163.01 |
+| CUDA | 12.8 |
+| PyTorch | `2.7.0a0+7c8ec84dab.nv25.03` |
+| Model | Qwen3-8B |
+| Inference Framework | nano-vLLM |
 
 ## Implementation
 
