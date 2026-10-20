@@ -2,6 +2,13 @@
   <img src="assets/Pewee.png" alt="Pewee Logo" width="180">
 </p>
 
+<p align="center">
+  <em>
+    "PEWEE reactors are smaller than their NERVA and PHOEBUS counterparts<br>
+    and, therefore, can be built and tested in less time and at lower cost."<br>--United States Aeronautics and Space Activities, 1968
+  </em>
+</p>
+
 # Pewee
 
 a lightweight CUDA kernel library for W4A16 (INT4 weights × FP16 activations) linear operations in PyTorch.
