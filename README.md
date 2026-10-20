@@ -35,25 +35,11 @@ Inspired by [AWQ](https://github.com/mit-han-lab/llm-awq) and [MiLo](https://git
 - C++20-compatible compiler
 - NVIDIA CUTLASS/CuTe headers
 
-The project has been developed and tested on the following configuration:
-
-| Component | Environment |
-|---|---|
-| GPU | NVIDIA RTX 3050 Ti Laptop (SM 8.6) |
-| OS | Ubuntu on WSL2 |
-| CUDA Toolkit | 13.3 |
-| PyTorch | 2.14.0+cu130 |
-| Precision | W4A16 (INT4 / FP16) |
-
-Other GPU architectures and software configurations have not yet been fully validated.
+Pewee has been tested on NVIDIA RTX 3050 Ti Laptop and NVIDIA A10 GPUs, both based on SM 8.6. Other GPU architectures have not yet been fully validated.
 
 ### Build from Source
 
-First, install a CUDA-enabled version of PyTorch compatible with your CUDA toolchain.
-
 Make sure the NVIDIA CUTLASS headers are available and their include directory is configured for the build. In particular, the compiler must be able to locate `cute/tensor.hpp`.
-
-From the project root, build and install the CUDA extension:
 
 ```bash
 python -m pip install -e . --no-build-isolation
@@ -64,9 +50,6 @@ To verify that the Python package can be imported:
 ```bash
 python -c "import lowbitlinear; print(lowbitlinear.__file__)"
 ```
-
-
-**Note:** Building from source requires a compatible CUDA toolchain and the CUTLASS/CuTe headers. Installation and correctness have been exercised in the development environment; clean-environment installation and cross-GPU compatibility still require further validation.
 
 ## Quick Start
 
