@@ -198,7 +198,11 @@ The benchmark is intended to evaluate GEMV and GEMM performance across different
 For GPU profiling:
 
 ```bash
-python benchmarks/profile_w4a16.py
+# CuTe GEMM
+python benchmarks/profile_w4a16.py --operator gemm --shape MxNxK
+
+# Warp Vec GEMV
+python benchmarks/profile_w4a16.py --operator gemv --shape MxNxK
 ```
 
 See [benchmarks/README.md](benchmarks/README.md) for detailed benchmark configurations, measurement methodology, and profiling instructions.

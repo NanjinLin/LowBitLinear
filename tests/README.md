@@ -86,8 +86,7 @@ one-hot 与精确多 stage case 使用零容差。量化误差单独按 scale �
 - CUDA toolkit 与 CUTLASS/CuTe headers 存在。
 - 当前 shell 找不到 Ninja，旧测试 import 时 JIT 因此报环境错误；正式路径使用已有扩展，无需 JIT。
   不能将 Ninja 缺失归类为 kernel 回归，也没有通过删除正式 CuTe 覆盖来绕过它。
-- 需要重建时沿用已有说明：`python -m pip install -e . --no-build-isolation`
-  （`scripts/build_cuda.py` 也是这一入口），保持项目原依赖约束，并先准备 toolkit/CuTe/构建工具。
+- 需要重建时沿用已有说明：`python -m pip install -e . --no-build-isolation`，保持项目原依赖约束，并先准备 toolkit/CuTe/构建工具。
 
 在 WSL 执行：
 

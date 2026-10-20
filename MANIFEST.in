@@ -1,0 +1,7 @@
+# Keep formal CUDA sources in the sdist even when setup selects a CPU-only build.
+include csrc/w4a16_gemv_warp_vec.cu
+include csrc/cute_w4a16_gemm.cu
+
+# Ship fixtures and helpers together with the test modules.
+recursive-include tests *.py
+include tests/README.md
