@@ -1,104 +1,123 @@
-import os
-from pathlib import Path
-
+"""Formal CuTe W4A16 operator, including masked MNK tails and empty dimensions."""
+import pytest
 import torch
-from torch.utils.cpp_extension import load
 
-ROOT = Path(__file__).resolve().parents[1]
-CUTLASS_INCLUDE = os.path.expanduser(
-    os.environ.get("CUTLASS_INCLUDE", "~/projects/cutlass/include")
-)
+from lowbitlinear.quantization import pack_int4, quantize_int4
 
-load(
-    name="lowbitlinear_cute_w4a16_ext",
-    sources=[str(ROOT / "csrc" / "cute_w4a16_gemm.cu")],
-    extra_include_paths=[CUTLASS_INCLUDE],
-    extra_cflags=["-std=c++20"],
-    extra_cuda_cflags=["-std=c++20", "-lineinfo"],
-    is_python_module=False,
-    verbose=True,
-)
-
-op = torch.ops.lowbitlinear_cute_w4a16.gemm
-
-def pack_uint4(q: torch.Tensor) -> torch.Tensor:
-    """[N,K] values 0..15 -> [N,ceil(K/8)] packed int32."""
-    n, k = q.shape
-    padded_k = ((k + 7) // 8) * 8
-    q64 = torch.zeros((n, padded_k), device=q.device, dtype=torch.int64)
-    q64[:, :k] = q.to(torch.int64)
-    packed = torch.zeros((n, padded_k // 8), device=q.device, dtype=torch.int64)
-    for nibble in range(8):
-        packed |= q64[:, nibble::8] << (4 * nibble)
-    return packed.to(torch.int32).contiguous()
+ATOL, RTOL = 2e-3, 1e-3
+SHAPES = [
+    (1, 1, 1), (4, 9, 7), (4, 8, 8), (4, 8, 63), (32, 32, 64),
+    (17, 23, 65), (5, 9, 70), (6, 10, 71), (31, 33, 127),
+    (6, 10, 128), (33, 37, 129), (64, 65, 130), (79, 70, 192),
+    (32, 64, 512), (7, 35, 4096),
+]
 
 
-def unpack_uint4(packed: torch.Tensor, k: int) -> torch.Tensor:
-    n = packed.shape[0]
-    words = packed.to(torch.int64)
-    return torch.stack(
-        [(words >> (4 * nibble)) & 0xF for nibble in range(8)], dim=-1
-    ).reshape(n, packed.shape[1] * 8)[:, :k]
+@pytest.mark.parametrize("m,n,k", SHAPES)
+@pytest.mark.parametrize("real_quant", [False, True], ids=["synthetic-int4", "real-quantization"])
+def test_gemm(m, n, k, real_quant, cuda_ops, packed_reference):
+    x = torch.randn(m, k, device=cuda_ops, dtype=torch.float16)
+    if real_quant:
+        # No manual weight padding: exercise the actual quantization pipeline.
+        q, scales, zeros = quantize_int4(torch.randn(n, k, device=cuda_ops, dtype=torch.float16))
+    else:
+        q = torch.randint(0, 16, (n, k), device=cuda_ops, dtype=torch.uint8)
+        q[:, 7::8] = 15
+        groups = (k + 63) // 64
+        scales = torch.rand(n, groups, device=cuda_ops) * .08 + .01
+        zeros = torch.randint(0, 16, (n, groups), device=cuda_ops, dtype=torch.int32)
+    args = x, pack_int4(q), scales, zeros
+    expected = packed_reference(*args, mma=True)
+    actual = torch.ops.lowbitlinear_cute_w4a16.gemm(*args)
+    assert actual.shape == (m, n) and actual.dtype == torch.float16
+    assert actual.device == x.device and torch.isfinite(actual).all()
+    # FP16 MMA operands match the oracle; tolerance covers reduction/FP16 output rounding.
+    torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)
 
 
-def check_case(label, M, N, K, *, exact=False, highbit=False):
-    device = "cuda"
-    X = torch.randn((M, K), device=device, dtype=torch.float16)
-    q = torch.randint(0, 16, (N, K), device=device, dtype=torch.int32)
-    if highbit:
-        q[:, 7::8] = 15  # ensure packed INT32 high bit is set
-    groups = (K + 63) // 64
-    scales = (torch.rand((N, groups), device=device) * 0.08 + 0.01).float()
-    zeros = torch.randint(0, 16, (N, groups), device=device, dtype=torch.int32)
-
-    if exact:
-        X.fill_(1)
-        q.fill_(5)
-        scales.fill_(0.25)
-        zeros.fill_(3)
-
-    packed = pack_uint4(q)
-    unpacked = unpack_uint4(packed, K)
-    torch.testing.assert_close(unpacked.to(torch.int32), q, atol=0, rtol=0)
-
-    # Reference matches the kernel's FP32 dequant -> FP16 MMA operand policy.
-    group_index = torch.arange(K, device=device) // 64
-    w_half = ((unpacked.float() - zeros[:, group_index].float()) *
-              scales[:, group_index]).half()
-    expected = (X.float() @ w_half.float().T).half()
-    actual = op(X.contiguous(), packed, scales.contiguous(), zeros.contiguous())
-    torch.cuda.synchronize()
-    atol = 0 if exact else 0.02
-    rtol = 0 if exact else 0.01
-    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
-    max_err = ((actual.float() - expected.float()).abs().max().item()
-               if actual.numel() else 0.0)
-    print(f"{label:27s} M={M:3d} N={N:3d} K={K:3d} "
-          f"PASS  max_abs_err={max_err:.6f}")
-
-def main():
-    torch.manual_seed(42)
-    assert torch.cuda.is_available(), "CUDA GPU required"
-    cases = [
-        (32, 32, 64),   # original tile, now loop-compatible
-        (1, 1, 1),      # all three dimensions smaller than a tile
-        (17, 23, 65),   # M/N/K tails and 2 quant groups
-        (17, 23, 129),  # exact multi-K accumulation across 3 groups
-        (31, 33, 127),  # N crosses a CTA, K not multiple of 64
-        (33, 37, 129),  # M/N cross CTA, third group, K tail
-        (64, 65, 130),  # multiple CTAs and multiple K stages
-        (79, 70, 192),  # nontrivial M/N tails, full K stages
-        (4, 9, 7),      # incomplete packed word
-        (32, 32, 0),    # no K: zero result
-        (0, 32, 65),    # empty M
-        (32, 0, 65),    # empty N
-    ]
-    for M, N, K in cases:
-        check_case("fixed + arbitrary MNK", M, N, K,
-                   exact=(M, N, K) in ((32, 32, 64), (17, 23, 129)),
-                   highbit=(M, N, K) == (33, 37, 129))
-    print("All arbitrary-MNK W4A16 checks PASS")
+@pytest.mark.parametrize("m,n,k", [(32, 32, 64), (17, 23, 129)])
+def test_exact_multistage_accumulation(m, n, k, cuda_ops):
+    x = torch.ones(m, k, device=cuda_ops, dtype=torch.float16)
+    packed = pack_int4(torch.full((n, k), 5, device=cuda_ops, dtype=torch.uint8))
+    scales = torch.full((n, (k + 63) // 64), .25, device=cuda_ops)
+    zeros = torch.full_like(scales, 3, dtype=torch.int32)
+    actual = torch.ops.lowbitlinear_cute_w4a16.gemm(x, packed, scales, zeros)
+    torch.testing.assert_close(actual, torch.full_like(actual, k * .5), rtol=0, atol=0)
 
 
-if __name__ == "__main__":
-    main()
+def test_one_hot_mapping(cuda_ops):
+    m, n, k = 33, 65, 129
+    x = (torch.arange(m * k, device=cuda_ops).reshape(m, k) % 101).half()
+    q = torch.zeros(n, k, dtype=torch.uint8, device=cuda_ops)
+    positions = (torch.arange(n, device=cuda_ops) * 2) % k
+    q[torch.arange(n, device=cuda_ops), positions] = 1
+    scales = torch.ones(n, (k + 63) // 64, device=cuda_ops)
+    zeros = torch.zeros_like(scales, dtype=torch.int32)
+    actual = torch.ops.lowbitlinear_cute_w4a16.gemm(x, pack_int4(q), scales, zeros)
+    torch.testing.assert_close(actual, x[:, positions], rtol=0, atol=0)
+
+
+def test_fp16_dequantization_policy(cuda_ops, packed_reference):
+    # This distinguishes the MMA oracle from the FP32-dequant GEMV/reference policy.
+    x = torch.ones(1, 65, device=cuda_ops, dtype=torch.float16)
+    q = torch.ones(1, 65, device=cuda_ops, dtype=torch.uint8)
+    scales = torch.tensor([[1.0004, 1.03]], device=cuda_ops)
+    zeros = torch.zeros(1, 2, device=cuda_ops, dtype=torch.int32)
+    args = x, pack_int4(q), scales, zeros
+    expected = packed_reference(*args, mma=True)
+    assert not torch.equal(expected, packed_reference(*args))
+    torch.testing.assert_close(torch.ops.lowbitlinear_cute_w4a16.gemm(*args), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m,n,k", [(32, 32, 0), (0, 32, 65), (32, 0, 65), (0, 0, 0)])
+def test_empty_dimensions(m, n, k, cuda_ops):
+    x = torch.empty(m, k, device=cuda_ops, dtype=torch.float16)
+    packed = torch.empty(n, (k + 7) // 8, device=cuda_ops, dtype=torch.int32)
+    scales = torch.empty(n, (k + 63) // 64, device=cuda_ops)
+    zeros = torch.empty_like(scales, dtype=torch.int32)
+    actual = torch.ops.lowbitlinear_cute_w4a16.gemm(x, packed, scales, zeros)
+    assert actual.shape == (m, n) and actual.dtype == x.dtype and actual.device == x.device
+    assert torch.count_nonzero(actual) == 0
+
+
+@pytest.mark.parametrize("index", range(4), ids=["x", "packed", "scales", "zeros"])
+@pytest.mark.parametrize("bad", ["dtype", "rank", "noncontiguous", "cpu"])
+def test_invalid_tensor_contract(index, bad, gemv_inputs):
+    args = list(gemv_inputs())
+    tensor = args[index]
+    if bad == "dtype":
+        args[index] = tensor.double()
+        match = ["float16", "int32", "float32", "int32"][index]
+    elif bad == "rank":
+        args[index] = tensor.flatten()
+        match = "2D"
+    elif bad == "noncontiguous":
+        args[index] = torch.zeros(tensor.shape[0], tensor.shape[1] * 2,
+                                 device=tensor.device, dtype=tensor.dtype)[:, ::2]
+        assert not args[index].is_contiguous()
+        match = "contiguous"
+    else:
+        args[index] = tensor.cpu()
+        match = "CUDA"
+    with pytest.raises(RuntimeError, match=match):
+        torch.ops.lowbitlinear_cute_w4a16.gemm(*args)
+
+
+@pytest.mark.parametrize("index,match", [(1, "packed_w must have shape"), (2, "scales must have shape"), (3, "zeros must have shape")])
+def test_invalid_metadata_shape(index, match, gemv_inputs):
+    args = list(gemv_inputs())
+    args[index] = args[index][:, :-1].contiguous()
+    with pytest.raises(RuntimeError, match=match):
+        torch.ops.lowbitlinear_cute_w4a16.gemm(*args)
+
+
+def test_uses_current_stream(gemv_inputs, packed_reference):
+    args = gemv_inputs(n=37)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        x = args[0] * 2
+        actual = torch.ops.lowbitlinear_cute_w4a16.gemm(x, *args[1:])
+        consumed = actual + 1
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.testing.assert_close(consumed, packed_reference(x, *args[1:], mma=True) + 1, atol=ATOL, rtol=RTOL)
